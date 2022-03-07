@@ -2,6 +2,7 @@
  * Watermeter sensor (Proximity Sensor)
  * (c) 2022 PA1DVB
  * Rev. 1.2 - 25 Feb 2022
+ * Rev. 1.3 - 7 Mrt 2022, Added TEST_ONLY flag
  */
  
 #include <ArduinoJson.h>
@@ -14,13 +15,18 @@
 
 #include "Config.h"
 
-#define TIME_SERVER "nl.pool.ntp.org"
+//#define TEST_ONLY
+
+#ifndef TEST_ONLY
+  #define TIME_SERVER "nl.pool.ntp.org"
+#endif
 #ifdef TIME_SERVER
   #include <time.h>
 #endif
 
 uint8_t mqttRetryCounter = 0;
 
+#ifndef TEST_ONLY
 WiFiManager wifiManager;
 WiFiClient wifiClient;
 PubSubClient mqttClient;
@@ -32,6 +38,7 @@ WiFiManagerParameter custom_mqtt_pass("pass", "MQTT Password", Config::mqtt_pass
 
 uint32_t lastMqttConnectionAttempt = 0;
 const uint16_t mqttConnectionInterval = 60000; // 1 minute = 60 seconds = 60000 milliseconds
+#endif
 
 uint32_t statusPublishPreviousMillis = 0;
 const uint16_t statusPublishInterval = 5000; // 30 seconds = 30000 milliseconds
@@ -46,10 +53,12 @@ uint16_t pulse_counts = 0;
 
 char identifier[24];
 
-#define app_version "2022.02.25 rev 1.2"
+#define app_version "2022.02.25 rev 1.3"
 #define FIRMWARE_PREFIX "esp8266-watermeter-sensor"
 #define AVAILABILITY_ONLINE "online"
 #define AVAILABILITY_OFFLINE "offline"
+
+#ifndef TEST_ONLY
 char MQTT_TOPIC_AVAILABILITY[128];
 char MQTT_TOPIC_STATE[128];
 char MQTT_TOPIC_COMMAND[128];
@@ -133,6 +142,7 @@ void handleWebNotFound() {
   }
   webServer.send(404, "text/plain", message);
 }
+#endif
 
 void setup() {
     Serial.begin(9600);
@@ -149,9 +159,10 @@ void setup() {
     delay(3000);
 
     // initialize the GPIO Input pin for our water sensor
-    pinMode(gpio_input_pin, INPUT_PULLUP);
+    pinMode(gpio_input_pin, INPUT_PULLUP); //INPUT_PULLUP
 
     snprintf(identifier, sizeof(identifier), "WATERMETER-%X", ESP.getChipId());
+#ifndef TEST_ONLY    
     WiFi.hostname(identifier);
 
     snprintf(MQTT_TOPIC_AVAILABILITY, 127, "%s/%s/status", FIRMWARE_PREFIX, identifier);
@@ -166,7 +177,6 @@ void setup() {
     //After connection it could take some time (mostly less then 1 minute) before time is synced
     configTime(0, 0, TIME_SERVER, "time.nist.gov");
     setenv("TZ", "Central Europe Time-2:00", 0);
-    
 
     setupWifi();
     setupOTA();
@@ -178,11 +188,60 @@ void setup() {
 
     Serial.printf("Hostname: %s\n", identifier);
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-
+#endif
     Serial.println("-- Current GPIO Configuration --");
     Serial.printf("PIN_GPIO_IN: %d\n", gpio_input_pin);
 }
 
+void loop() {
+    ArduinoOTA.handle();
+#ifndef TEST_ONLY    
+    mqttClient.loop();
+    webServer.handleClient();
+#endif
+    const uint32_t currentMillis = millis();
+
+    if (currentMillis - pinReadPreviousMillis >= pinReadInterval) {
+        pinReadPreviousMillis = currentMillis;
+
+        // read the state of the water sensor
+        int gpioState_ = digitalRead(gpio_input_pin);
+        if (gpioState_ != gpio_state) {
+          //we got a state change
+          gpio_state = gpioState_;
+          if (gpio_state == LOW) {
+            output4State = "LOW";
+#ifdef TEST_ONLY            
+            printf("Count erbij!\n");
+#endif            
+            pulse_counts++;
+          } else {
+            output4State = "HIGH";
+          }
+        }
+    }
+
+    if (currentMillis - statusPublishPreviousMillis >= statusPublishInterval) {
+        statusPublishPreviousMillis = currentMillis;
+
+        if (pulse_counts > 0) {
+          printf("total published pulses: %d!\n", pulse_counts);
+#ifndef TEST_ONLY          
+          publishState();
+#endif          
+          pulse_counts=0;
+        }
+    }
+#ifndef TEST_ONLY
+    if (!mqttClient.connected() && currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval) {
+        lastMqttConnectionAttempt = currentMillis;
+        printf("Reconnect mqtt\n");
+        mqttReconnect();
+    }
+#endif    
+}
+
+#ifndef TEST_ONLY
 void setupOTA() {
     ArduinoOTA.onStart([]() { Serial.println("Start"); });
     ArduinoOTA.onEnd([]() { Serial.println("\nEnd"); });
@@ -209,48 +268,6 @@ void setupOTA() {
     // This is less of a security measure and more a accidential flash prevention
     ArduinoOTA.setPassword(identifier);
     ArduinoOTA.begin();
-}
-
-void loop() {
-    ArduinoOTA.handle();
-    mqttClient.loop();
-    webServer.handleClient();
-
-    const uint32_t currentMillis = millis();
-
-    if (currentMillis - pinReadPreviousMillis >= pinReadInterval) {
-        pinReadPreviousMillis = currentMillis;
-
-        // read the state of the water sensor
-        int gpioState_ = digitalRead(gpio_input_pin);
-        if (gpioState_ != gpio_state) {
-          //we got a state change
-          gpio_state = gpioState_;
-          if (gpio_state == LOW) {
-            output4State = "LOW";
-//REMOVE COMMENT TO DEBUG            printf("Count erbij!\n");
-            pulse_counts++;
-          } else {
-            output4State = "HIGH";
-          }
-        }
-    }
-
-    if (currentMillis - statusPublishPreviousMillis >= statusPublishInterval) {
-        statusPublishPreviousMillis = currentMillis;
-
-        if (pulse_counts > 0) {
-          printf("total published pulses: %d!\n", pulse_counts);
-          publishState();
-          pulse_counts=0;
-        }
-    }
-
-    if (!mqttClient.connected() && currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval) {
-        lastMqttConnectionAttempt = currentMillis;
-        printf("Reconnect mqtt\n");
-        mqttReconnect();
-    }
 }
 
 void setupWifi() {
@@ -373,3 +390,4 @@ void publishAutoConfig() {
 
     autoconfPayload.clear();
 }
+#endif
