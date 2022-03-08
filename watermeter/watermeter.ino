@@ -46,7 +46,7 @@ const uint16_t statusPublishInterval = 5000; // 30 seconds = 30000 milliseconds
 uint32_t pinReadPreviousMillis = 0;
 const uint16_t pinReadInterval = 10; //100 times a second
 
-const int gpio_input_pin = 4; //GPIO4
+#define gpio_input_pin D2 //GPIO4
 int gpio_state = 0;
 String output4State = "off";
 uint16_t pulse_counts = 0;
