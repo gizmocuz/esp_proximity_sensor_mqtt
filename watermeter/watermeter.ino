@@ -3,6 +3,7 @@
  * (c) 2022 PA1DVB
  * Rev. 1.2 - 25 Feb 2022
  * Rev. 1.3 - 7 Mrt 2022, Added TEST_ONLY flag
+ * Rev. 1.4 - Timestamp in state message
  */
  
 #include <ArduinoJson.h>
@@ -53,7 +54,7 @@ uint16_t pulse_counts = 0;
 
 char identifier[24];
 
-#define app_version "2022.02.25 rev 1.3"
+#define app_version "2022.02.25 rev 1.4"
 #define FIRMWARE_PREFIX "esp8266-watermeter-sensor"
 #define AVAILABILITY_ONLINE "online"
 #define AVAILABILITY_OFFLINE "offline"
@@ -84,7 +85,7 @@ String GetLocalTimeString()
   char szTime[40];
   if (gtime->tm_year == 0)
     return "Not synced yet!";
-  sprintf(szTime,"%04d/%02d/%02d,%02d:%02d:%02d", gtime->tm_year+1900, gtime->tm_mon, gtime->tm_mday, gtime->tm_hour, gtime->tm_min, gtime->tm_sec);
+  sprintf(szTime,"%04d/%02d/%02d,%02d:%02d:%02d", gtime->tm_year+1900, gtime->tm_mon + 1, gtime->tm_mday, gtime->tm_hour, gtime->tm_min, gtime->tm_sec);
   return String(szTime);
 }
 #endif
@@ -337,6 +338,10 @@ void publishState() {
 
     stateJson["wifi"] = wifiJson.as<JsonObject>();
 
+#ifdef TIME_SERVER
+    stateJson["timestamp"] = time(nullptr);
+#endif
+
     serializeJson(stateJson, payload);
     mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], false);
 }
@@ -382,9 +387,6 @@ void publishAutoConfig() {
     autoconfPayload["value_template"] = "{{value_json.pulses}}";
     autoconfPayload["unique_id"] = identifier + String("_pulses");
     autoconfPayload["icon"] = "mdi:counter-inc"; //incremental counter
-#ifdef TIME_SERVER
-    autoconfPayload["timestamp"] = time(nullptr);
-#endif
     serializeJson(autoconfPayload, mqttPayload);
     mqttClient.publish(&MQTT_TOPIC_AUTOCONF_PULSE_SENSOR[0], &mqttPayload[0], true);
 
