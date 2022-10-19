@@ -13,8 +13,8 @@ Use it as a boiler template if you wish!
 
 ## Used Hardware
 
-Proximity Sensor NPN 5Volt  
-ESP8266
+Proximity Sensor NPN 5Volt, directly connected to the ESP8266 (GND/VIN and D2) ~ 5$
+ESP8266 (NodeMCU) $3
 
 ## Enclosure
 
