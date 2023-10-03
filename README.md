@@ -13,8 +13,9 @@ Use it as a boiler template if you wish!
 
 ## Used Hardware
 
-Proximity Sensor NPN 5Volt, directly connected to the ESP8266 (GND/VIN and D2) ~ 5$
+Proximity Sensor NPN 5Volt, directly connected to the ESP8266 (GND/VIn and D2) ~ 5$
 ESP8266 (NodeMCU) $3
+When using the NodeMCU V3, use the VU pin instead of the VIn pin to power the sensor.
 
 ## Enclosure
 
