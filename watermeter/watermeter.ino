@@ -4,6 +4,7 @@
  * Rev. 1.2 - 25 Feb 2022
  * Rev. 1.3 - 7 Mrt 2022, Added TEST_ONLY flag
  * Rev. 1.4 - Timestamp in state message
+ * Rev. 1.5 - 19 Jan 2025
  */
  
 #include <ArduinoJson.h>
@@ -54,7 +55,7 @@ uint16_t pulse_counts = 0;
 
 char identifier[24];
 
-#define app_version "2022.02.25 rev 1.4"
+#define app_version "2025.01.19 rev 1.5"
 #define FIRMWARE_PREFIX "esp8266-watermeter-sensor"
 #define AVAILABILITY_ONLINE "online"
 #define AVAILABILITY_OFFLINE "offline"
