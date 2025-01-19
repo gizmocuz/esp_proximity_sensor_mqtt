@@ -364,8 +364,10 @@ void publishAutoConfig() {
     device["sw_version"] = app_version;
 
     autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["device_class"] = "signal_strength";
     autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
     autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["state_class"] = "measurement";
     autoconfPayload["name"] = identifier + String(" WiFi");
     autoconfPayload["value_template"] = "{{value_json.wifi.rssi}}";
     autoconfPayload["unique_id"] = identifier + String("_wifi");
@@ -380,8 +382,10 @@ void publishAutoConfig() {
     autoconfPayload.clear();
 
     autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["device_class"] = "water";
     autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
     autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["state_class"] = "measurement";
     autoconfPayload["name"] = identifier;
     autoconfPayload["unit_of_measurement"] = "L";
     autoconfPayload["value_template"] = "{{value_json.pulses}}";
