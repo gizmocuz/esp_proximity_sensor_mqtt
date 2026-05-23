@@ -14,6 +14,7 @@
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
+#include <WiFiClientSecureBearSSL.h>
 #include <PubSubClient.h>
 #include <WiFiManager.h>
 
@@ -33,12 +34,19 @@ uint8_t mqttRetryCounter = 0;
 #ifndef TEST_ONLY
 WiFiManager wifiManager;
 WiFiClient wifiClient;
+WiFiClientSecure wifiClientSecure;
 PubSubClient mqttClient;
 ESP8266WebServer webServer(80);
 
 WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", Config::mqtt_server, sizeof(Config::mqtt_server));
 WiFiManagerParameter custom_mqtt_user("user", "MQTT Username", Config::mqtt_username, sizeof(Config::mqtt_username));
 WiFiManagerParameter custom_mqtt_pass("pass", "MQTT Password", Config::mqtt_password, sizeof(Config::mqtt_password));
+
+// Port and TLS need their own string-backed buffers because they aren't char arrays in Config.
+char mqtt_port_str[6]   = "1883";
+char mqtt_secure_str[2] = "0";
+WiFiManagerParameter custom_mqtt_port  ("port",   "MQTT Port (default 1883)", mqtt_port_str,   sizeof(mqtt_port_str));
+WiFiManagerParameter custom_mqtt_secure("secure", "Use TLS? 1=yes, 0=no",     mqtt_secure_str, sizeof(mqtt_secure_str));
 
 uint32_t lastMqttConnectionAttempt = 0;
 const uint16_t mqttConnectionInterval = 60000; // 1 minute = 60 seconds = 60000 milliseconds
@@ -97,6 +105,18 @@ String GetLocalTimeString()
   return String(szTime);
 }
 #endif
+
+// Bind the right TCP client to PubSubClient based on the current secure flag,
+// then apply the configured server + port. Call after changing any of those.
+void applyMqttClient() {
+  if (Config::mqtt_secure) {
+    wifiClientSecure.setInsecure();   // skip cert validation per design
+    mqttClient.setClient(wifiClientSecure);
+  } else {
+    mqttClient.setClient(wifiClient);
+  }
+  mqttClient.setServer(Config::mqtt_server, Config::mqtt_port);
+}
 
 String formatUptime(uint32_t ms) {
   uint32_t s = ms / 1000;
@@ -166,13 +186,14 @@ void handleWebRoot() {
   h += F("<div class=\"stat\"><div class=\"k\">IP</div><div class=\"v\" id=\"ip\">--</div></div>");
   h += F("<div class=\"stat\"><div class=\"k\">RSSI</div><div class=\"v\" id=\"rssi\">--</div></div>");
   h += F("<div class=\"stat\"><div class=\"k\">MQTT</div><div class=\"v\" id=\"mqtt\">--</div></div>");
+  h += F("<div class=\"stat\"><div class=\"k\">MQTT broker</div><div class=\"v\" id=\"mqtt_srv\" style=\"font-size:.85rem\">--</div></div>");
   h += F("<div class=\"stat\"><div class=\"k\">Uptime</div><div class=\"v\" id=\"up\">--</div></div>");
 #ifdef TIME_SERVER
   h += F("<div class=\"stat\"><div class=\"k\">UTC time</div><div class=\"v\" id=\"tm\">--</div></div>");
 #endif
   h += F("</div></div>");
 
-  h += F("<div class=\"foot\">Each pulse = 1&nbsp;L &middot; <a href=\"/reset\" style=\"color:var(--mut)\">factory reset</a></div></div>");
+  h += F("<div class=\"foot\">Each pulse = 1&nbsp;L &middot; <a href=\"/mqtt\" style=\"color:var(--mut)\">configure MQTT</a> &middot; <a href=\"/reset\" style=\"color:var(--mut)\">factory reset</a></div></div>");
 
   h += F("<script>");
   h += F("function esc(s){return String(s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}");
@@ -186,7 +207,10 @@ void handleWebRoot() {
   h += F("document.getElementById('host').textContent=j.host;");
   h += F("document.getElementById('ip').textContent=j.ip;");
   h += F("document.getElementById('rssi').textContent=j.rssi+' dBm';");
-  h += F("document.getElementById('mqtt').textContent=j.mqtt?'connected':'disconnected';");
+  h += F("const sMap={'-4':'timeout','-3':'lost','-2':'connect failed','-1':'disconnected','0':'connected','1':'bad protocol','2':'bad client id','3':'unavailable','4':'bad auth','5':'unauthorized'};");
+  h += F("const mE=document.getElementById('mqtt');mE.textContent=j.mqtt?'connected':('disconnected ('+(sMap[j.mqtt_state]||j.mqtt_state)+')');");
+  h += F("mE.style.color=j.mqtt?'var(--ok)':'var(--off)';");
+  h += F("document.getElementById('mqtt_srv').textContent=j.mqtt_server||'(not set)';");
   h += F("document.getElementById('up').textContent=j.uptime;");
 #ifdef TIME_SERVER
   h += F("if(j.time)document.getElementById('tm').textContent=j.time;");
@@ -205,6 +229,8 @@ void handleWebStatus() {
   json["ip"]      = WiFi.localIP().toString();
   json["rssi"]    = WiFi.RSSI();
   json["mqtt"]    = mqttClient.connected();
+  json["mqtt_server"] = String(Config::mqtt_server) + ":" + String(Config::mqtt_port) + (Config::mqtt_secure ? " (TLS)" : "");
+  json["mqtt_state"]  = mqttClient.state();
   json["state"]   = output4State;
   json["total"]   = total_pulses;
   json["pending"] = pulse_counts;
@@ -221,6 +247,81 @@ void handleWebStatus() {
 void handleWebReset() {
   webServer.send(200, "text/plain", "Done! Device is restarting and will be available as a WiFi access point again!");
   resetWifiSettingsAndReboot();
+}
+
+void handleMqttConfig() {
+  String h;
+  h.reserve(2048);
+  h += F("<!DOCTYPE html><html><head><meta charset=\"utf-8\">");
+  h += F("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+  h += F("<title>MQTT config</title><link rel=\"icon\" href=\"data:,\">");
+  h += F("<style>:root{--bg:#0e1626;--card:#172033;--card2:#1f2a44;--fg:#e6ecf5;--mut:#8a98b3;--acc:#5ad1ff;--ok:#54e09d;}");
+  h += F("*{box-sizing:border-box}html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}");
+  h += F(".wrap{max-width:480px;margin:0 auto;padding:24px 16px}");
+  h += F("h1{margin:0 0 16px 0;font-size:1.4rem}h1 span{color:var(--acc)}");
+  h += F(".card{background:var(--card);border-radius:10px;padding:20px}");
+  h += F("label{display:block;color:var(--mut);font-size:.8rem;text-transform:uppercase;letter-spacing:.5px;margin:12px 0 4px}");
+  h += F("input{width:100%;padding:10px 12px;background:var(--card2);border:1px solid #2a3148;color:var(--fg);border-radius:6px;font-size:1rem}");
+  h += F("input:focus{outline:none;border-color:var(--acc)}");
+  h += F("button{margin-top:18px;width:100%;padding:12px;background:var(--ok);color:#0e1626;border:none;border-radius:6px;font-size:1rem;font-weight:600;cursor:pointer}");
+  h += F("a{color:var(--mut);font-size:.85rem;display:inline-block;margin-top:12px}");
+  h += F("</style></head><body><div class=\"wrap\"><h1><span>MQTT</span> config</h1><div class=\"card\">");
+  h += F("<form method=\"POST\" action=\"/mqtt\">");
+  h += F("<label>Broker host (IP or hostname)</label>");
+  h += F("<input name=\"server\" maxlength=\"79\" value=\"");
+  h += String(Config::mqtt_server);
+  h += F("\">");
+  h += F("<label>Port</label>");
+  h += F("<input name=\"port\" type=\"number\" min=\"1\" max=\"65535\" value=\"");
+  h += String(Config::mqtt_port);
+  h += F("\">");
+  h += F("<label style=\"display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:.9rem;color:var(--fg)\">");
+  h += F("<input type=\"checkbox\" name=\"secure\" value=\"1\" style=\"width:auto;margin:0\"");
+  if (Config::mqtt_secure) h += F(" checked");
+  h += F("> Use TLS (skip certificate validation)</label>");
+  h += F("<label>Username (optional)</label>");
+  h += F("<input name=\"user\" maxlength=\"23\" value=\"");
+  h += String(Config::mqtt_username);
+  h += F("\">");
+  h += F("<label>Password (leave empty to keep current)</label>");
+  h += F("<input name=\"pass\" type=\"password\" maxlength=\"23\" value=\"\">");
+  h += F("<button type=\"submit\">Save and reconnect</button></form>");
+  h += F("<a href=\"/\">&larr; back to status</a></div></div></body></html>");
+  webServer.send(200, "text/html", h);
+}
+
+void handleMqttConfigSave() {
+  if (webServer.hasArg("server")) {
+    strncpy(Config::mqtt_server, webServer.arg("server").c_str(), sizeof(Config::mqtt_server) - 1);
+    Config::mqtt_server[sizeof(Config::mqtt_server) - 1] = 0;
+  }
+  if (webServer.hasArg("port")) {
+    long p = webServer.arg("port").toInt();
+    if (p >= 1 && p <= 65535) Config::mqtt_port = (uint16_t)p;
+  }
+  // Checkbox is only sent in the POST when checked; treat absence as off.
+  Config::mqtt_secure = webServer.hasArg("secure");
+  if (webServer.hasArg("user")) {
+    strncpy(Config::mqtt_username, webServer.arg("user").c_str(), sizeof(Config::mqtt_username) - 1);
+    Config::mqtt_username[sizeof(Config::mqtt_username) - 1] = 0;
+  }
+  // Only overwrite the password when a value was actually entered.
+  if (webServer.hasArg("pass") && webServer.arg("pass").length() > 0) {
+    strncpy(Config::mqtt_password, webServer.arg("pass").c_str(), sizeof(Config::mqtt_password) - 1);
+    Config::mqtt_password[sizeof(Config::mqtt_password) - 1] = 0;
+  }
+  Config::save();
+
+  // Apply the new server and force a fresh connect attempt on the next loop.
+  mqttClient.disconnect();
+  applyMqttClient();
+  lastMqttConnectionAttempt = 0;
+
+  String h;
+  h += F("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"2;url=/\">");
+  h += F("<style>body{background:#0e1626;color:#e6ecf5;font-family:-apple-system,sans-serif;text-align:center;padding:40px}</style>");
+  h += F("</head><body><h2>Saved.</h2><p>Returning to status page...</p></body></html>");
+  webServer.send(200, "text/html", h);
 }
 
 void handleWebNotFound() {
@@ -276,13 +377,19 @@ void setup() {
     setupWifi();
     setupOTA();
 
-    mqttClient.setServer(Config::mqtt_server, 1883);
+    applyMqttClient();
     mqttClient.setKeepAlive(10);
     mqttClient.setBufferSize(2048);
     mqttClient.setCallback(mqttCallback);
 
     Serial.printf("Hostname: %s\n", identifier);
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("MQTT broker: %s:%u (%s)\n", Config::mqtt_server, Config::mqtt_port, Config::mqtt_secure ? "TLS" : "plain");
+
+    // Trigger the first MQTT connect attempt immediately rather than waiting
+    // a full mqttConnectionInterval (60s).
+    printf("Initial mqtt connect\n");
+    mqttReconnect();
 #endif
     Serial.println("-- Current GPIO Configuration --");
     Serial.printf("PIN_GPIO_IN: %d\n", gpio_input_pin);
@@ -394,9 +501,20 @@ void setupWifi() {
     wifiManager.setConnectTimeout(60);       // retry saved WiFi for 60 s before opening portal
     wifiManager.setConfigPortalTimeout(0);   // keep portal open indefinitely; we retry saved creds in parallel
 
+    // Pre-fill portal fields from the currently loaded config so the captive
+    // portal shows what's actually saved (not the C++ static-init defaults).
+    custom_mqtt_server.setValue(Config::mqtt_server, sizeof(Config::mqtt_server));
+    custom_mqtt_user  .setValue(Config::mqtt_username, sizeof(Config::mqtt_username));
+    custom_mqtt_pass  .setValue(Config::mqtt_password, sizeof(Config::mqtt_password));
+    snprintf(mqtt_port_str, sizeof(mqtt_port_str), "%u", Config::mqtt_port);
+    custom_mqtt_port  .setValue(mqtt_port_str, sizeof(mqtt_port_str));
+    custom_mqtt_secure.setValue(Config::mqtt_secure ? "1" : "0", sizeof(mqtt_secure_str));
+
     wifiManager.addParameter(&custom_mqtt_server);
+    wifiManager.addParameter(&custom_mqtt_port);
     wifiManager.addParameter(&custom_mqtt_user);
     wifiManager.addParameter(&custom_mqtt_pass);
+    wifiManager.addParameter(&custom_mqtt_secure);
 
     WiFi.hostname(identifier);
 
@@ -426,10 +544,12 @@ void setupWifi() {
             }
         }
     }
-    mqttClient.setClient(wifiClient);
+    // (applyMqttClient() in setup() binds the right TCP client based on Config::mqtt_secure)
 
     webServer.on("/", handleWebRoot);
     webServer.on("/status", handleWebStatus);
+    webServer.on("/mqtt", HTTP_GET,  handleMqttConfig);
+    webServer.on("/mqtt", HTTP_POST, handleMqttConfigSave);
     webServer.on("/reset", handleWebReset);
     webServer.onNotFound(handleWebNotFound);
     webServer.begin();
@@ -437,6 +557,11 @@ void setupWifi() {
     strcpy(Config::mqtt_server, custom_mqtt_server.getValue());
     strcpy(Config::mqtt_username, custom_mqtt_user.getValue());
     strcpy(Config::mqtt_password, custom_mqtt_pass.getValue());
+    {
+      long p = atol(custom_mqtt_port.getValue());
+      if (p >= 1 && p <= 65535) Config::mqtt_port = (uint16_t)p;
+    }
+    Config::mqtt_secure = (custom_mqtt_secure.getValue()[0] == '1');
 
     if (shouldSaveConfig) {
         Config::save();
