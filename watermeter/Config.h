@@ -9,7 +9,7 @@ namespace Config {
     char mqtt_password[24] = "";
 
     void save() {
-        DynamicJsonDocument json(512);
+        JsonDocument json;
         json["mqtt_server"] = mqtt_server;
         json["mqtt_username"] = mqtt_username;
         json["mqtt_password"] = mqtt_password;
@@ -34,7 +34,7 @@ namespace Config {
                     std::unique_ptr<char[]> buf(new char[size]);
 
                     configFile.readBytes(buf.get(), size);
-                    DynamicJsonDocument json(512);
+                    JsonDocument json;
 
                     if (DeserializationError::Ok == deserializeJson(json, buf.get())) {
                         strcpy(mqtt_server, json["mqtt_server"]);

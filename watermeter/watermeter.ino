@@ -5,6 +5,7 @@
  * Rev. 1.3 - 7 Mrt 2022, Added TEST_ONLY flag
  * Rev. 1.4 - Timestamp in state message
  * Rev. 1.5 - 19 Jan 2025
+ * Rev. 1.6 - 23 May 2026, WiFi auto-reconnect, non-blocking MQTT retry, fetch-poll web UI
  */
  
 #include <ArduinoJson.h>
@@ -40,6 +41,9 @@ WiFiManagerParameter custom_mqtt_pass("pass", "MQTT Password", Config::mqtt_pass
 
 uint32_t lastMqttConnectionAttempt = 0;
 const uint16_t mqttConnectionInterval = 60000; // 1 minute = 60 seconds = 60000 milliseconds
+
+uint32_t lastWifiCheck = 0;
+const uint16_t wifiCheckInterval = 30000; // every 30s, retry STA if dropped
 #endif
 
 uint32_t statusPublishPreviousMillis = 0;
@@ -55,7 +59,7 @@ uint16_t pulse_counts = 0;
 
 char identifier[24];
 
-#define app_version "2025.01.19 rev 1.5"
+#define app_version "2026.05.23 rev 1.6"
 #define FIRMWARE_PREFIX "esp8266-watermeter-sensor"
 #define AVAILABILITY_ONLINE "online"
 #define AVAILABILITY_OFFLINE "offline"
@@ -95,34 +99,44 @@ void handleWebRoot() {
   String returnStr;
   AddToStringLF(returnStr, "<!DOCTYPE html><html>");
   AddToStringLF(returnStr, "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-  AddToStringLF(returnStr, "<meta http-equiv=\"refresh\" content=\"3\" >");
   AddToStringLF(returnStr, "<link rel=\"icon\" href=\"data:,\">");
-  // CSS to style the on/off buttons 
-  // Feel free to change the background-color and font-size attributes to fit your preferences
   AddToStringLF(returnStr, "<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
   AddToStringLF(returnStr, ".button { background-color: #195B6A; border: none; color: white; padding: 16px 40px;");
   AddToStringLF(returnStr, "text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}");
   AddToStringLF(returnStr, ".buttonOn {background-color: #17A2FC;}");
   AddToStringLF(returnStr, ".lgray {color: #ccc;}");
   AddToStringLF(returnStr, "</style></head>");
-  
-  // Web Page Heading
+
   AddToStringLF(returnStr, "<body><h1>PA1DVB Watersensor Server</h1>");
-  
-  // Display current state, and ON/OFF buttons for GPIO 4  
-  AddToStringLF(returnStr, "<p>GPIO 4 - State " + output4State + "</p>");
-  // If the output4State is off, it displays the ON button       
-  if (output4State=="LOW") {
-    AddToStringLF(returnStr, "<p><button class=\"button\">LOW</button></p>");
-  } else {
-    AddToStringLF(returnStr, "<p><button class=\"button buttonOn\">HIGH</button></p>");
-  }
+  AddToStringLF(returnStr, "<p>GPIO 4 - State <span id=\"st\">--</span></p>");
+  AddToStringLF(returnStr, "<p><button id=\"btn\" class=\"button\">--</button></p>");
   AddToStringLF(returnStr, "<p><small class=\"lgray\">version: " + String(app_version) + "</small></p>");
 #ifdef TIME_SERVER
-  AddToStringLF(returnStr, "<p><small class=\"lgray\">UTC_Time: " + GetLocalTimeString() + "</small></p>");
+  AddToStringLF(returnStr, "<p><small class=\"lgray\">UTC_Time: <span id=\"tm\">--</span></small></p>");
 #endif
-  AddToStringLF(returnStr, "</body></html>");  
+  AddToStringLF(returnStr, "<script>");
+  AddToStringLF(returnStr, "async function poll(){try{const r=await fetch('/status');const j=await r.json();");
+  AddToStringLF(returnStr, "document.getElementById('st').textContent=j.state;");
+  AddToStringLF(returnStr, "const b=document.getElementById('btn');b.textContent=j.state;");
+  AddToStringLF(returnStr, "b.className='button'+(j.state=='HIGH'?' buttonOn':'');");
+#ifdef TIME_SERVER
+  AddToStringLF(returnStr, "if(j.time)document.getElementById('tm').textContent=j.time;");
+#endif
+  AddToStringLF(returnStr, "}catch(e){}}");
+  AddToStringLF(returnStr, "poll();setInterval(poll,3000);");
+  AddToStringLF(returnStr, "</script></body></html>");
   webServer.send(200, "text/html", returnStr);
+}
+
+void handleWebStatus() {
+  JsonDocument json;
+  json["state"] = output4State;
+#ifdef TIME_SERVER
+  json["time"] = GetLocalTimeString();
+#endif
+  String out;
+  serializeJson(json, out);
+  webServer.send(200, "application/json", out);
 }
 
 void handleWebReset() {
@@ -147,7 +161,7 @@ void handleWebNotFound() {
 #endif
 
 void setup() {
-    Serial.begin(9600);
+    Serial.begin(115200);
 
     Serial.println("\n");
     Serial.println("Watermeter sensor (c) 2022 PDA1DVB!");
@@ -228,19 +242,36 @@ void loop() {
 
         if (pulse_counts > 0) {
           printf("total published pulses: %d!\n", pulse_counts);
-#ifndef TEST_ONLY          
-          publishState();
-#endif          
-          pulse_counts=0;
+#ifndef TEST_ONLY
+          // Only clear the counter when we actually got the pulses out the door.
+          // Otherwise (no WiFi / no MQTT) we keep accumulating instead of losing them.
+          if (mqttClient.connected() && publishState()) {
+              pulse_counts = 0;
+          } else {
+              printf("publish failed, retaining %d pulses\n", pulse_counts);
+          }
+#else
+          pulse_counts = 0;
+#endif
         }
     }
 #ifndef TEST_ONLY
+    // WiFi-drop watchdog: if the link dropped after boot, kick the radio.
+    if (currentMillis - lastWifiCheck >= wifiCheckInterval) {
+        lastWifiCheck = currentMillis;
+        if (WiFi.status() != WL_CONNECTED) {
+            printf("WiFi: link down, calling reconnect()\n");
+            WiFi.reconnect();
+        }
+    }
     if (!mqttClient.connected() && currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval) {
         lastMqttConnectionAttempt = currentMillis;
-        printf("Reconnect mqtt\n");
-        mqttReconnect();
+        if (WiFi.status() == WL_CONNECTED) {
+            printf("Reconnect mqtt\n");
+            mqttReconnect();
+        }
     }
-#endif    
+#endif
 }
 
 #ifndef TEST_ONLY
@@ -275,19 +306,49 @@ void setupOTA() {
 void setupWifi() {
     // Uncomment and run it once, if you want to erase all the stored information
     //wifiManager.resetSettings();
-  
+
     wifiManager.setDebugOutput(false);
     wifiManager.setSaveConfigCallback(saveConfigCallback);
+    wifiManager.setConfigPortalBlocking(false);
+    wifiManager.setConnectTimeout(60);       // retry saved WiFi for 60 s before opening portal
+    wifiManager.setConfigPortalTimeout(0);   // keep portal open indefinitely; we retry saved creds in parallel
 
     wifiManager.addParameter(&custom_mqtt_server);
     wifiManager.addParameter(&custom_mqtt_user);
     wifiManager.addParameter(&custom_mqtt_pass);
 
     WiFi.hostname(identifier);
-    wifiManager.autoConnect(identifier);
+
+    Serial.println("WiFi: connecting...");
+    if (!wifiManager.autoConnect(identifier)) {
+        // Saved credentials failed — portal is now open. Keep retrying the
+        // stored network so we recover automatically when the router/DNS
+        // comes back after an outage, without rebooting.
+        Serial.println("WiFi: AP portal open, waiting for credentials (retrying saved network every 30s)...");
+        uint32_t apStart   = millis();
+        uint32_t lastRetry = millis();
+        while (WiFi.status() != WL_CONNECTED) {
+            wifiManager.process();
+            ArduinoOTA.handle();   // keep OTA reachable while we're stuck here
+            webServer.handleClient();
+            delay(20);
+            yield();
+            if (millis() - lastRetry > 30000UL) {
+                lastRetry = millis();
+                Serial.println("WiFi: retrying saved credentials...");
+                WiFi.reconnect();
+            }
+            // Safety net: if the portal has been open for >12 h reboot.
+            if (millis() - apStart > 12UL * 60UL * 60UL * 1000UL) {
+                Serial.println("WiFi: AP open >12h with no connection, rebooting...");
+                ESP.restart();
+            }
+        }
+    }
     mqttClient.setClient(wifiClient);
 
     webServer.on("/", handleWebRoot);
+    webServer.on("/status", handleWebStatus);
     webServer.on("/reset", handleWebReset);
     webServer.onNotFound(handleWebNotFound);
     webServer.begin();
@@ -313,52 +374,47 @@ void resetWifiSettingsAndReboot() {
 }
 
 void mqttReconnect() {
-    for (uint8_t attempt = 0; attempt < 3; ++attempt) {
-        if (mqttClient.connect(identifier, Config::mqtt_username, Config::mqtt_password, MQTT_TOPIC_AVAILABILITY, 1, true, AVAILABILITY_OFFLINE)) {
-            mqttClient.publish(MQTT_TOPIC_AVAILABILITY, AVAILABILITY_ONLINE, true);
-            publishAutoConfig();
-
-            // Make sure to subscribe after polling the status so that we never execute commands with the default data
-            mqttClient.subscribe(MQTT_TOPIC_COMMAND);
-            break;
-        }
-        delay(5000);
+    // Single non-blocking attempt; the outer loop retries every mqttConnectionInterval ms,
+    // which keeps ArduinoOTA / web server responsive between attempts.
+    if (mqttClient.connect(identifier, Config::mqtt_username, Config::mqtt_password,
+                           MQTT_TOPIC_AVAILABILITY, 1, true, AVAILABILITY_OFFLINE)) {
+        mqttClient.publish(MQTT_TOPIC_AVAILABILITY, AVAILABILITY_ONLINE, true);
+        publishAutoConfig();
+        // Subscribe after auto-config so we never execute commands with default data
+        mqttClient.subscribe(MQTT_TOPIC_COMMAND);
+    } else {
+        printf("MQTT connect failed (state=%d)\n", mqttClient.state());
     }
 }
 
-void publishState() {
-    DynamicJsonDocument wifiJson(192);
-    DynamicJsonDocument stateJson(604);
+bool publishState() {
+    JsonDocument stateJson;
     char payload[256];
 
-    wifiJson["ssid"] = WiFi.SSID();
-    wifiJson["ip"] = WiFi.localIP().toString();
-    wifiJson["rssi"] = WiFi.RSSI();
+    JsonObject wifi = stateJson["wifi"].to<JsonObject>();
+    wifi["ssid"] = WiFi.SSID();
+    wifi["ip"]   = WiFi.localIP().toString();
+    wifi["rssi"] = WiFi.RSSI();
 
     stateJson["pulses"] = pulse_counts;
-
-    stateJson["wifi"] = wifiJson.as<JsonObject>();
-
 #ifdef TIME_SERVER
     stateJson["timestamp"] = time(nullptr);
 #endif
 
     serializeJson(stateJson, payload);
-    mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], false);
+    return mqttClient.publish(MQTT_TOPIC_STATE, payload, false);
 }
 
 void mqttCallback(char* topic, uint8_t* payload, unsigned int length) { }
 
 void publishAutoConfig() {
     char mqttPayload[2048];
-    DynamicJsonDocument device(256);
-    DynamicJsonDocument autoconfPayload(1024);
-    StaticJsonDocument<64> identifiersDoc;
-    JsonArray identifiers = identifiersDoc.to<JsonArray>();
+    JsonDocument device;
+    JsonDocument autoconfPayload;
 
+    JsonArray identifiers = device["identifiers"].to<JsonArray>();
     identifiers.add(identifier);
 
-    device["identifiers"] = identifiers;
     device["manufacturer"] = "PA1DVB";
     device["model"] = "WATERSENSOR";
     device["name"] = identifier;
