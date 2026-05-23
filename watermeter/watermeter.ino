@@ -6,6 +6,7 @@
  * Rev. 1.4 - Timestamp in state message
  * Rev. 1.5 - 19 Jan 2025
  * Rev. 1.6 - 23 May 2026, WiFi auto-reconnect, non-blocking MQTT retry, fetch-poll web UI
+ * Rev. 1.7 - 23 May 2026, Lifetime pulse/m3 counter and dark-themed status dashboard
  */
  
 #include <ArduinoJson.h>
@@ -55,11 +56,13 @@ const uint16_t pinReadInterval = 10; //100 times a second
 #define gpio_input_pin D2 //GPIO4
 int gpio_state = 0;
 String output4State = "off";
-uint16_t pulse_counts = 0;
+uint16_t pulse_counts = 0;        // pulses pending publish (cleared on successful MQTT publish)
+uint32_t total_pulses = 0;        // lifetime pulses since boot (never reset)
+uint32_t last_pulse_millis = 0;   // millis() of most recent pulse, 0 if none yet
 
 char identifier[24];
 
-#define app_version "2026.05.23 rev 1.6"
+#define app_version "2026.05.23 rev 1.7"
 #define FIRMWARE_PREFIX "esp8266-watermeter-sensor"
 #define AVAILABILITY_ONLINE "online"
 #define AVAILABILITY_OFFLINE "offline"
@@ -95,42 +98,118 @@ String GetLocalTimeString()
 }
 #endif
 
-void handleWebRoot() {
-  String returnStr;
-  AddToStringLF(returnStr, "<!DOCTYPE html><html>");
-  AddToStringLF(returnStr, "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-  AddToStringLF(returnStr, "<link rel=\"icon\" href=\"data:,\">");
-  AddToStringLF(returnStr, "<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
-  AddToStringLF(returnStr, ".button { background-color: #195B6A; border: none; color: white; padding: 16px 40px;");
-  AddToStringLF(returnStr, "text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}");
-  AddToStringLF(returnStr, ".buttonOn {background-color: #17A2FC;}");
-  AddToStringLF(returnStr, ".lgray {color: #ccc;}");
-  AddToStringLF(returnStr, "</style></head>");
+String formatUptime(uint32_t ms) {
+  uint32_t s = ms / 1000;
+  uint32_t d = s / 86400;  s %= 86400;
+  uint32_t h = s / 3600;   s %= 3600;
+  uint32_t m = s / 60;     s %= 60;
+  char buf[32];
+  if (d > 0) snprintf(buf, sizeof(buf), "%lud %02lu:%02lu:%02lu", (unsigned long)d, (unsigned long)h, (unsigned long)m, (unsigned long)s);
+  else       snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", (unsigned long)h, (unsigned long)m, (unsigned long)s);
+  return String(buf);
+}
 
-  AddToStringLF(returnStr, "<body><h1>PA1DVB Watersensor Server</h1>");
-  AddToStringLF(returnStr, "<p>GPIO 4 - State <span id=\"st\">--</span></p>");
-  AddToStringLF(returnStr, "<p><button id=\"btn\" class=\"button\">--</button></p>");
-  AddToStringLF(returnStr, "<p><small class=\"lgray\">version: " + String(app_version) + "</small></p>");
+String formatAgo(uint32_t deltaMs) {
+  uint32_t s = deltaMs / 1000;
+  if (s < 60)    return String(s) + "s ago";
+  if (s < 3600)  return String(s / 60) + "m " + String(s % 60) + "s ago";
+  if (s < 86400) return String(s / 3600) + "h " + String((s % 3600) / 60) + "m ago";
+  return String(s / 86400) + "d " + String((s % 86400) / 3600) + "h ago";
+}
+
+void handleWebRoot() {
+  String h;
+  h.reserve(4096);
+  h += F("<!DOCTYPE html><html><head><meta charset=\"utf-8\">");
+  h += F("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+  h += F("<title>Watermeter</title>");
+  h += F("<link rel=\"icon\" href=\"data:,\">");
+  h += F("<style>");
+  h += F(":root{--bg:#0e1626;--card:#172033;--card2:#1f2a44;--fg:#e6ecf5;--mut:#8a98b3;--acc:#5ad1ff;--ok:#54e09d;--off:#ff7a7a;--lo:#7fbcff;}");
+  h += F("*{box-sizing:border-box}html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.4}");
+  h += F(".wrap{max-width:760px;margin:0 auto;padding:24px 16px}");
+  h += F("h1{margin:0 0 4px 0;font-size:1.6rem;letter-spacing:.5px}h1 span{color:var(--acc)}");
+  h += F(".sub{color:var(--mut);font-size:.9rem;margin-bottom:20px}");
+  h += F(".card{background:var(--card);border-radius:10px;padding:16px 18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.3)}");
+  h += F(".card h2{margin:0 0 12px 0;font-size:1rem;color:var(--acc);text-transform:uppercase;letter-spacing:1px}");
+  h += F(".big{font-size:2.8rem;font-weight:700;color:var(--ok);text-align:center;margin:8px 0 2px 0;font-variant-numeric:tabular-nums}");
+  h += F(".big .u{font-size:1rem;color:var(--mut);font-weight:400;margin-left:6px}");
+  h += F(".sm{text-align:center;color:var(--mut);font-size:.85rem;margin-bottom:6px}");
+  h += F(".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}");
+  h += F(".stat{background:var(--card2);padding:10px 12px;border-radius:8px}");
+  h += F(".stat .k{color:var(--mut);font-size:.75rem;text-transform:uppercase;letter-spacing:.5px}");
+  h += F(".stat .v{font-size:1.05rem;font-weight:600;margin-top:2px;word-break:break-all;font-variant-numeric:tabular-nums}");
+  h += F(".pin{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.8rem;font-weight:600}");
+  h += F(".pin.HIGH{background:#1e3a55;color:var(--lo)}.pin.LOW{background:#163826;color:var(--ok)}.pin.off{background:#2a2f44;color:var(--mut)}");
+  h += F(".foot{color:var(--mut);font-size:.75rem;text-align:center;margin-top:16px}");
+  h += F(".pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:middle;animation:p 2s ease-in-out infinite}");
+  h += F("@keyframes p{0%,100%{opacity:1}50%{opacity:.3}}");
+  h += F("</style></head><body><div class=\"wrap\">");
+
+  h += F("<h1><span>Water</span>meter</h1>");
+  h += F("<div class=\"sub\"><span class=\"pulse\"></span><span id=\"live\">live</span> &middot; v");
+  h += String(app_version);
+  h += F("</div>");
+
+  h += F("<div class=\"card\"><h2>Lifetime usage (since boot)</h2>");
+  h += F("<div class=\"big\"><span id=\"m3\">0.000</span><span class=\"u\">m&sup3;</span></div>");
+  h += F("<div class=\"sm\"><span id=\"liters\">0</span> L &middot; <span id=\"pulses\">0</span> pulses</div></div>");
+
+  h += F("<div class=\"card\"><h2>Sensor</h2><div class=\"grid\">");
+  h += F("<div class=\"stat\"><div class=\"k\">GPIO state</div><div class=\"v\"><span id=\"st\" class=\"pin off\">--</span></div></div>");
+  h += F("<div class=\"stat\"><div class=\"k\">Last pulse</div><div class=\"v\" id=\"last\">--</div></div>");
+  h += F("<div class=\"stat\"><div class=\"k\">Pending publish</div><div class=\"v\" id=\"pend\">--</div></div>");
+  h += F("</div></div>");
+
+  h += F("<div class=\"card\"><h2>System</h2><div class=\"grid\">");
+  h += F("<div class=\"stat\"><div class=\"k\">Hostname</div><div class=\"v\" id=\"host\">--</div></div>");
+  h += F("<div class=\"stat\"><div class=\"k\">IP</div><div class=\"v\" id=\"ip\">--</div></div>");
+  h += F("<div class=\"stat\"><div class=\"k\">RSSI</div><div class=\"v\" id=\"rssi\">--</div></div>");
+  h += F("<div class=\"stat\"><div class=\"k\">MQTT</div><div class=\"v\" id=\"mqtt\">--</div></div>");
+  h += F("<div class=\"stat\"><div class=\"k\">Uptime</div><div class=\"v\" id=\"up\">--</div></div>");
 #ifdef TIME_SERVER
-  AddToStringLF(returnStr, "<p><small class=\"lgray\">UTC_Time: <span id=\"tm\">--</span></small></p>");
+  h += F("<div class=\"stat\"><div class=\"k\">UTC time</div><div class=\"v\" id=\"tm\">--</div></div>");
 #endif
-  AddToStringLF(returnStr, "<script>");
-  AddToStringLF(returnStr, "async function poll(){try{const r=await fetch('/status');const j=await r.json();");
-  AddToStringLF(returnStr, "document.getElementById('st').textContent=j.state;");
-  AddToStringLF(returnStr, "const b=document.getElementById('btn');b.textContent=j.state;");
-  AddToStringLF(returnStr, "b.className='button'+(j.state=='HIGH'?' buttonOn':'');");
+  h += F("</div></div>");
+
+  h += F("<div class=\"foot\">Each pulse = 1&nbsp;L &middot; <a href=\"/reset\" style=\"color:var(--mut)\">factory reset</a></div></div>");
+
+  h += F("<script>");
+  h += F("function esc(s){return String(s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}");
+  h += F("async function poll(){try{const r=await fetch('/status');const j=await r.json();");
+  h += F("document.getElementById('m3').textContent=(j.total/1000).toFixed(3);");
+  h += F("document.getElementById('liters').textContent=j.total;");
+  h += F("document.getElementById('pulses').textContent=j.total;");
+  h += F("const stE=document.getElementById('st');stE.textContent=j.state;stE.className='pin '+(j.state||'off');");
+  h += F("document.getElementById('last').textContent=j.last_pulse||'never';");
+  h += F("document.getElementById('pend').textContent=j.pending+' L';");
+  h += F("document.getElementById('host').textContent=j.host;");
+  h += F("document.getElementById('ip').textContent=j.ip;");
+  h += F("document.getElementById('rssi').textContent=j.rssi+' dBm';");
+  h += F("document.getElementById('mqtt').textContent=j.mqtt?'connected':'disconnected';");
+  h += F("document.getElementById('up').textContent=j.uptime;");
 #ifdef TIME_SERVER
-  AddToStringLF(returnStr, "if(j.time)document.getElementById('tm').textContent=j.time;");
+  h += F("if(j.time)document.getElementById('tm').textContent=j.time;");
 #endif
-  AddToStringLF(returnStr, "}catch(e){}}");
-  AddToStringLF(returnStr, "poll();setInterval(poll,3000);");
-  AddToStringLF(returnStr, "</script></body></html>");
-  webServer.send(200, "text/html", returnStr);
+  h += F("document.getElementById('live').textContent='live';");
+  h += F("}catch(e){document.getElementById('live').textContent='offline';}}");
+  h += F("poll();setInterval(poll,3000);");
+  h += F("</script></body></html>");
+
+  webServer.send(200, "text/html", h);
 }
 
 void handleWebStatus() {
   JsonDocument json;
-  json["state"] = output4State;
+  json["host"]    = identifier;
+  json["ip"]      = WiFi.localIP().toString();
+  json["rssi"]    = WiFi.RSSI();
+  json["mqtt"]    = mqttClient.connected();
+  json["state"]   = output4State;
+  json["total"]   = total_pulses;
+  json["pending"] = pulse_counts;
+  json["uptime"]  = formatUptime(millis());
+  json["last_pulse"] = (last_pulse_millis == 0) ? String("never") : formatAgo(millis() - last_pulse_millis);
 #ifdef TIME_SERVER
   json["time"] = GetLocalTimeString();
 #endif
@@ -231,6 +310,8 @@ void loop() {
             printf("Count erbij!\n");
 #endif            
             pulse_counts++;
+            total_pulses++;
+            last_pulse_millis = millis();
           } else {
             output4State = "HIGH";
           }
