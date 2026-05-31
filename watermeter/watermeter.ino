@@ -544,6 +544,13 @@ void setupWifi() {
             }
         }
     }
+
+    // Disable WiFi modem sleep. By default the ESP8266 parks the radio between DTIM
+    // beacons, adding ~100 ms latency to every web/OTA request when the device is
+    // otherwise idle. Costs ~15 mA more idle current. (ESP8266 API: setSleepMode,
+    // there is no WiFi.setSleep() as on the ESP32.)
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
+
     // (applyMqttClient() in setup() binds the right TCP client based on Config::mqtt_secure)
 
     webServer.on("/", handleWebRoot);
